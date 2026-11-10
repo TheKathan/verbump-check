@@ -1,0 +1,136 @@
+name: verbump check
+description: Preview the release a pull request will make with verbump, and fail now if that release would fail at merge.
+author: TheKathan
+branding:
+  icon: check-circle
+  color: blue
+
+# Run on pull_request after actions/checkout with fetch-depth: 0 (verbump needs the tags).
+# Nothing in the workspace changes: the release notes are previewed in a throwaway worktree.
+
+inputs:
+  branch:
+    description: "Branch whose name picks the bump, as on merge: feature/* and feat/* minor, the rest patch, release/<package>/X.Y.Z exact. Default: the PR's source branch."
+    required: false
+    default: ${{ github.head_ref }}
+  bump:
+    description: "major, minor or patch instead of the branch rule, e.g. when your release takes the bump from somewhere else."
+    required: false
+    default: ""
+  config:
+    description: "Path to verbump.toml, relative to working-directory."
+    required: false
+    default: "verbump.toml"
+  working-directory:
+    description: "Repo root."
+    required: false
+    default: "."
+  verbump-version:
+    description: 'verbump to install with setup-verbump: "1" (latest 1.x), an exact version such as "1.0.1", or a pip requirement.'
+    required: false
+    default: "1"
+  install:
+    description: 'Install verbump. "false" uses the verbump already on the PATH, e.g. from an earlier setup-verbump step.'
+    required: false
+    default: "true"
+
+outputs:
+  releases:
+    description: "How many packages merging this PR would release."
+    value: ${{ steps.plan.outputs.count }}
+  tags:
+    description: "JSON array of the tags merging this PR would create."
+    value: ${{ steps.plan.outputs.tags }}
+  plan:
+    description: "Path to the plan JSON."
+    value: ${{ steps.plan.outputs.plan }}
+  report-file:
+    description: "Path to the Markdown report (also in the job summary)."
+    value: ${{ steps.report.outputs.file }}
+
+runs:
+  using: composite
+  steps:
+    - uses: TheKathan/setup-verbump@v1
+      if: inputs.install == 'true'
+      with:
+        version: ${{ inputs.verbump-version }}
+
+    - name: Version files agree
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        CONFIG: ${{ inputs.config }}
+      run: |
+        set -euo pipefail
+        command -v verbump >/dev/null || { echo "::error::verbump is not on the PATH; leave install on or run TheKathan/setup-verbump first"; exit 1; }
+        verbump --version
+        verbump -c "$CONFIG" check
+
+    - name: Plan the release this PR makes
+      id: plan
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        CONFIG: ${{ inputs.config }}
+        BRANCH: ${{ inputs.branch }}
+        BUMP: ${{ inputs.bump }}
+      run: |
+        set -euo pipefail
+        plan="$RUNNER_TEMP/verbump-check-plan.json"
+        if [[ -n "$BUMP" ]]; then bump=(--bump "$BUMP"); else bump=(--branch "$BRANCH"); fi
+        verbump -c "$CONFIG" plan "${bump[@]}" --release-branch "$BRANCH" --plan-out "$plan"
+        {
+          echo "plan=$plan"
+          echo "count=$(jq '.releases | length' "$plan")"
+          echo "tags=$(jq -c '[.releases[].tag]' "$plan")"
+        } >> "$GITHUB_OUTPUT"
+
+    - name: Preview the release notes in a throwaway worktree
+      id: report
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        CONFIG: ${{ inputs.config }}
+        BRANCH: ${{ inputs.branch }}
+        BUMP: ${{ inputs.bump }}
+        PLAN: ${{ steps.plan.outputs.plan }}
+      run: |
+        set -euo pipefail
+        report="$RUNNER_TEMP/verbump-check.md"
+        {
+          echo "## verbump check"
+          echo
+          echo "Bump: **$(jq -r .bump "$PLAN")**, from ${BUMP:+the bump input}${BUMP:-branch \`${BRANCH:-none}\`}"
+          echo
+        } > "$report"
+        if [[ "$(jq '.releases | length' "$PLAN")" == "0" ]]; then
+          echo "Merging this PR releases nothing: no package changed since its last tag." >> "$report"
+        else
+          {
+            echo "Merging this PR releases:"
+            echo
+            echo "| Package | Previous | Version | Tag | Why |"
+            echo "|---|---|---|---|---|"
+            jq -r '.releases[] | "| \(.name) | \(.previous // "-") | \(.version) | `\(.tag)` | \(.reason) |"' "$PLAN"
+          } >> "$report"
+          wt="$RUNNER_TEMP/verbump-check-worktree"
+          root="$(git rev-parse --show-toplevel)"
+          sub="$(git rev-parse --show-prefix)"
+          git -C "$root" worktree add --quiet --detach "$wt" HEAD
+          trap 'git -C "$root" worktree remove --force "$wt"' EXIT
+          if [[ -n "$BUMP" ]]; then bump=(--bump "$BUMP"); else bump=(--branch "$BRANCH"); fi
+          (cd "$wt/$sub" && verbump -c "$CONFIG" apply "${bump[@]}" --release-branch "$BRANCH" >/dev/null 2>&1)
+          jq -r '.releases[] | "\(.name)\t\(.version)"' "$PLAN" | while IFS=$'\t' read -r name version; do
+            {
+              echo
+              echo "<details><summary>Release notes: $name $version</summary>"
+              echo
+              (cd "$wt/$sub" && verbump -c "$CONFIG" notes "$name" "$version")
+              echo
+              echo "</details>"
+            } >> "$report"
+          done
+        fi
+        cat "$report" >> "$GITHUB_STEP_SUMMARY"
+        echo "file=$report" >> "$GITHUB_OUTPUT"

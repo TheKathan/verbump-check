@@ -1,0 +1,118 @@
+name: test
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: actionlint
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          bash <(curl -sSfL https://raw.githubusercontent.com/rhysd/actionlint/v1.7.7/scripts/download-actionlint.bash) 1.7.7
+          ./actionlint -color
+
+      - name: A fixture repo where a PR changed web
+        run: |
+          set -euo pipefail
+          mkdir fixture && cd fixture
+          git init -q -b main && git config user.email ci@example.com && git config user.name ci
+          mkdir -p services/api apps/web
+          printf '[project]\nname = "api"\nversion = "1.4.0"\n' > services/api/pyproject.toml
+          printf '{\n  "name": "web",\n  "version": "0.3.0"\n}\n' > apps/web/package.json
+          cat > verbump.toml <<'TOML'
+          [packages.api]
+          path = "services/api"
+          files = ["pyproject.toml"]
+
+          [packages.web]
+          path = "apps/web"
+          files = ["package.json"]
+          TOML
+          echo 9.9.9 > services/api/VERSION
+          cat > bad.toml <<'TOML'
+          [packages.api]
+          path = "services/api"
+          files = ["pyproject.toml", "VERSION"]
+          TOML
+          git add -A && git commit -qm "chore(release): api 1.4.0, web 0.3.0"
+          git tag api/v1.4.0 && git tag web/v0.3.0
+          echo "export const checkout = () => 1" > apps/web/checkout.js
+          printf '# Changelog\n\n## [Unreleased]\n\n### Added\n- Checkout page.\n' > apps/web/CHANGELOG.md
+          git add -A && git commit -qm "feat(web): checkout page"
+
+      - name: A feature branch releases web
+        id: feature
+        uses: ./
+        with:
+          working-directory: fixture
+          branch: feature/checkout
+
+      - name: Check the feature run
+        env:
+          COUNT: ${{ steps.feature.outputs.releases }}
+          TAGS: ${{ steps.feature.outputs.tags }}
+          REPORT: ${{ steps.feature.outputs.report-file }}
+        run: |
+          set -euo pipefail
+          test "$COUNT" = 1
+          test "$TAGS" = '["web/v0.4.0"]'
+          # shellcheck disable=SC2016  # the backticks are literal Markdown
+          grep -qF '| web | 0.3.0 | 0.4.0 | `web/v0.4.0` | minor |' "$REPORT"
+          grep -q 'Release notes: web 0.4.0' "$REPORT"
+          grep -q -- '- Checkout page.' "$REPORT"
+          test -z "$(git -C fixture status --porcelain)"
+          grep -q '"version": "0.3.0"' fixture/apps/web/package.json
+
+      - name: A release branch that isn't newer fails
+        id: older
+        continue-on-error: true
+        uses: ./
+        with:
+          working-directory: fixture
+          branch: release/api/1.0.0
+          install: "false"
+
+      - name: Version files that disagree fail
+        id: disagree
+        continue-on-error: true
+        uses: ./
+        with:
+          working-directory: fixture
+          config: bad.toml
+          install: "false"
+
+      - name: Check the failures
+        env:
+          OLDER: ${{ steps.older.outcome }}
+          DISAGREE: ${{ steps.disagree.outcome }}
+        run: |
+          set -euo pipefail
+          test "$OLDER" = failure
+          test "$DISAGREE" = failure
+
+      - name: Nothing changed
+        run: git -C fixture tag -f web/v0.4.0 >/dev/null
+
+      - name: A PR that changes no package releases nothing
+        id: none
+        uses: ./
+        with:
+          working-directory: fixture
+          branch: docs/readme
+          install: "false"
+
+      - run: test "${{ steps.none.outputs.releases }}" = 0 && test "${{ steps.none.outputs.tags }}" = "[]"
